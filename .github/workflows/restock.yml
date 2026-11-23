@@ -1,0 +1,66 @@
+name: 러블리캣 메쉬수모 재입고 체크
+
+# 방식: 작업 하나가 켜진 채로 10초마다 확인 (최대 약 5시간 50분).
+# 끝나면 5분마다 도는 예약 실행이 다음 작업을 다시 띄워서 사실상 계속 감시함.
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # 작업이 끝났을 때 다시 띄우는 용도
+  workflow_dispatch:          # Actions 탭에서 바로 시작 / 디스코드 테스트
+    inputs:
+      test:
+        description: "true면 디스코드 테스트 메시지만 보내고 끝"
+        default: "false"
+
+# 동시에 하나만 실행 (예약 실행이 겹쳐도 중복으로 돌지 않음)
+concurrency:
+  group: restock-watch
+  cancel-in-progress: false
+
+permissions:
+  actions: write              # 알림 보낸 뒤 이 워크플로를 스스로 끄기 위해 필요
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355      # GitHub 작업 최대 시간(6시간)보다 조금 짧게
+    env:
+      URL: "https://pooltime.kr/product/%EB%9F%AC%EB%B8%94%EB%A6%AC%EC%BA%A3-%EB%A9%94%EC%89%AC%EC%88%98%EB%AA%A8/2243/category/236/display/1/"
+      WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      INTERVAL: "10"          # 확인 간격(초)
+      DURATION: "21000"       # 한 번 실행할 때 감시 시간(초) = 5시간 50분
+    steps:
+      - name: 디스코드 테스트
+        if: inputs.test == 'true'
+        run: |
+          payload=$(jq -n --arg c "🔔 [테스트] 재입고 알림 연결 확인!" '{content: $c}')
+          curl -sf -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK"
+
+      - name: 10초마다 재고 확인
+        if: inputs.test != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          end=$(( $(date +%s) + DURATION ))
+          n=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            n=$((n+1))
+            html=$(curl -sL --max-time 15 -A 'Mozilla/5.0' -H 'Cache-Control: no-cache' "$URL" || true)
+            soldout=$(printf '%s' "$html" | grep -o '"bSoldout":[a-z]*' | head -1 | cut -d: -f2)
+            stock=$(printf '%s' "$html" | grep -oP "var product_code = 'P0000DIH';var item_code = '[^']*';var item_count = '[^']*';var stock_number = '\K[0-9]+" | head -1)
+
+            if [ -z "$soldout" ] && [ -z "$stock" ]; then
+              echo "$(date +%T) #$n 페이지를 읽지 못함"
+            elif [ "$soldout" = "false" ] || [ "${stock:-0}" -gt 0 ]; then
+              echo "$(date +%T) #$n 재입고! stock=$stock"
+              msg="@everyone 🐱 러블리캣 메쉬수모 재입고! (재고 ${stock:-?}개, 23,000원) 지금 구매: https://pooltime.kr/product/%EB%9F%AC%EB%B8%94%EB%A6%AC%EC%BA%A3-%EB%A9%94%EC%89%AC%EC%88%98%EB%AA%A8/2243/"
+              payload=$(jq -n --arg c "$msg" '{content: $c}')
+              curl -sf -H 'Content-Type: application/json' -d "$payload" "$WEBHOOK"
+              # 알림 반복 방지: 이 워크플로 끄기 (다시 감시하려면 Actions 탭에서 Enable)
+              gh workflow disable restock.yml --repo "$GITHUB_REPOSITORY"
+              exit 0
+            else
+              [ $((n % 30)) -eq 1 ] && echo "$(date +%T) #$n 아직 품절 (stock=$stock)"
+            fi
+            sleep "$INTERVAL"
+          done
+          echo "감시 시간 종료 - 다음 예약 실행이 이어서 감시합니다"
